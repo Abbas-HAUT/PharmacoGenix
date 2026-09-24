@@ -20,8 +20,8 @@ from sklearn.impute import SimpleImputer
 # ==========================================
 # 1. PATH CONFIGURATION
 # ==========================================
-INPUT_PATH = r"M:\Screen Compounds\final_output_file.csv"
-OUTPUT_DIR = r"M:\Screen Compounds\results"
+INPUT_PATH = r".csv"
+OUTPUT_DIR = r"results"
 
 # Create output directory if it doesn't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
