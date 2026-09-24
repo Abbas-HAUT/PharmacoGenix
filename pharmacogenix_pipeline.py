@@ -1,383 +1,287 @@
-"""
-pharmacogenix_pipeline.py
-==============================================================================
-End-to-end reproduction of the PharmacoGenix study pipeline described in the
-manuscript methods, built directly on a preprocessed compound dataset that
-already contains:
-
-    molecule_chembl_id, canonical_smiles, standard_value, Activity Class,
-    MW, LogP, NumHDonors, NumHAcceptors, standard_value_norm, pIC50_values
-
-Pipeline stages (each maps to a section of the methods text):
-  1. Load & validate the dataset.
-  2. Outlier removal (IQR + Z-score) on the numeric descriptor/target columns.
-  3. Mann-Whitney U hypothesis testing (active vs. inactive) on MW, LogP,
-     NumHDonors, NumHAcceptors, standard_value_norm, pIC50_values, with
-     Seaborn/Matplotlib visualizations of each comparison.
-  4. Molecular fingerprint generation from canonical_smiles (RDKit Morgan/
-     ECFP fingerprints -- the "fingerprint descriptors" used as ML input;
-     see the note in generate_fingerprints() re: PaDEL, the tool literally
-     named in the manuscript).
-  5. Variance-threshold feature selection (threshold = 0.01, as specified).
-  6. Random Forest Regressor: 80/20 split, randomized hyperparameter search
-     over n_estimators / max_depth / min_samples_split, 5-fold cross-
-     validation, and R2 / RMSE evaluation on the held-out test set.
-  7. Persist the trained model + fingerprint config for the companion
-     Streamlit app (pharmacogenix_app.py).
-
-Run:
-    python pharmacogenix_pipeline.py --data compounds.csv --outdir results
-==============================================================================
-"""
 import os
-import json
-import argparse
-import warnings
-
-import numpy as np
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from scipy import stats
-
-try:
-    import pingouin as pg
-    HAVE_PINGOUIN = True
-except ImportError:
-    HAVE_PINGOUIN = False
-
-from rdkit import Chem
-from rdkit.Chem import AllChem, Descriptors, Lipinski, rdMolDescriptors
-from rdkit import RDLogger
-
-from sklearn.model_selection import train_test_split, RandomizedSearchCV, KFold, cross_val_score
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.feature_selection import VarianceThreshold
-from sklearn.impute import SimpleImputer
-from sklearn.metrics import r2_score, mean_squared_error
-from scipy.stats import randint
-
+from scipy.stats import mannwhitneyu
 import joblib
 
-warnings.filterwarnings("ignore")
-RDLogger.DisableLog('rdApp.*')
-sns.set_theme(style="whitegrid", context="paper", font_scale=1.1)
+# RDKit imports
+from rdkit import Chem
+from rdkit.Chem import Descriptors, Lipinski, AllChem
 
-REQUIRED_COLUMNS = ['molecule_chembl_id', 'canonical_smiles', 'standard_value', 'Activity Class',
-                    'MW', 'LogP', 'NumHDonors', 'NumHAcceptors', 'standard_value_norm', 'pIC50_values']
-UTEST_FEATURES = ['MW', 'LogP', 'NumHDonors', 'NumHAcceptors', 'standard_value_norm', 'pIC50_values']
+# Scikit-Learn imports
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.impute import SimpleImputer
 
+# ==========================================
+# 1. PATH CONFIGURATION
+# ==========================================
+INPUT_PATH = r"M:\Screen Compounds\final_output_file.csv"
+OUTPUT_DIR = r"M:\Screen Compounds\results"
 
-def parse_args():
-    p = argparse.ArgumentParser(description="PharmacoGenix RF-regressor pipeline")
-    p.add_argument('--data', type=str, required=True, help='Path to the compound CSV dataset.')
-    p.add_argument('--outdir', type=str, default='results', help='Output directory for models/plots/tables.')
-    p.add_argument('--radius', type=int, default=2, help='Morgan fingerprint radius (ECFP4 = radius 2).')
-    p.add_argument('--n_bits', type=int, default=1024, help='Morgan fingerprint bit-vector length.')
-    p.add_argument('--n_iter_search', type=int, default=25, help='RandomizedSearchCV iterations.')
-    p.add_argument('--cv_folds', type=int, default=5, help='Cross-validation folds.')
-    p.add_argument('--skip_tuning', action='store_true', help='Skip hyperparameter search (fast smoke test).')
-    p.add_argument('--random_state', type=int, default=42)
-    return p.parse_args()
+# Create output directory if it doesn't exist
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# ==========================================
+# 2. DATA LOADING & PREPROCESSING (RDKit)
+# ==========================================
+print("Loading data...")
+df = pd.read_csv(INPUT_PATH)
 
-# ==========================================================================
-# 1. LOAD & VALIDATE
-# ==========================================================================
-def load_data(path):
-    df = pd.read_csv(path)
-    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
-    if missing:
-        raise ValueError(f"Dataset is missing required column(s): {missing}\n"
-                          f"Columns found: {list(df.columns)}")
-    print(f"Loaded {len(df)} compounds from {path}")
-    print(df[REQUIRED_COLUMNS].describe(include='all').transpose().to_string())
-    return df
-
-
-def normalize_class_label(v):
-    """'Activity Class' values are mapped to {'active','inactive','intermediate'}
-    by substring match, since exact label spelling/casing can vary by source."""
-    v = str(v).strip().lower()
-    if 'inactive' in v:
-        return 'inactive'
-    if 'active' in v:
-        return 'active'
-    return 'intermediate'
-
-
-# ==========================================================================
-# 2. OUTLIER REMOVAL (IQR + Z-score, as specified in the methods)
-# ==========================================================================
-def remove_outliers(df, cols, z_thresh=3.0, iqr_k=1.5):
-    """
-    Keeps a row only if it passes BOTH the IQR whisker test and the Z-score
-    test for every column in `cols`. This directly implements the manuscript's
-    "IQR method and Z-score analysis" outlier removal step.
-    """
-    mask = pd.Series(True, index=df.index)
-    for col in cols:
-        x = df[col].astype(float)
-        q1, q3 = x.quantile(0.25), x.quantile(0.75)
-        iqr = q3 - q1
-        lo, hi = q1 - iqr_k * iqr, q3 + iqr_k * iqr
-        iqr_ok = x.between(lo, hi)
-        z = (x - x.mean()) / (x.std(ddof=0) + 1e-12)
-        z_ok = z.abs() <= z_thresh
-        mask &= (iqr_ok & z_ok)
-    n_removed = (~mask).sum()
-    print(f"Outlier removal (IQR + Z-score) on {cols}: removed {n_removed} of {len(df)} rows.")
-    return df[mask].reset_index(drop=True)
-
-
-# ==========================================================================
-# 3. MANN-WHITNEY U TESTING (active vs. inactive)
-# ==========================================================================
-def run_mannwhitney_tests(df, features, class_col='Activity Class', alpha=0.05):
-    df = df.copy()
-    df['_class'] = df[class_col].apply(normalize_class_label)
-    active = df[df['_class'] == 'active']
-    inactive = df[df['_class'] == 'inactive']
-    print(f"\nMann-Whitney U test group sizes -- active: {len(active)}, inactive: {len(inactive)}")
-
-    rows = []
-    for feat in features:
-        x, y = active[feat].dropna(), inactive[feat].dropna()
-        if HAVE_PINGOUIN:
-            res = pg.mwu(x, y, alternative='two-sided')
-            u_stat, p_val = res['U-val'].iloc[0], res['p-val'].iloc[0]
-            rbc = res['RBC'].iloc[0] if 'RBC' in res.columns else np.nan
-        else:
-            u_stat, p_val = stats.mannwhitneyu(x, y, alternative='two-sided')
-            rbc = np.nan
-        rows.append({'Feature': feat, 'U_statistic': u_stat, 'p_value': p_val,
-                     'rank_biserial_corr': rbc, 'significant_at_0.05': p_val < alpha})
-    return pd.DataFrame(rows), df
-
-
-def plot_mannwhitney_features(df_with_class, features, results_df, out_dir):
-    n = len(features)
-    ncols = 3
-    nrows = int(np.ceil(n / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 4.2 * nrows))
-    axes = np.array(axes).reshape(-1)
-
-    plot_df = df_with_class[df_with_class['_class'].isin(['active', 'inactive'])]
-    for i, feat in enumerate(features):
-        ax = axes[i]
-        sns.boxplot(data=plot_df, x='_class', y=feat, order=['inactive', 'active'],
-                    palette={'inactive': '#8C8C8C', 'active': '#0072B2'}, ax=ax, width=0.5)
-        sns.stripplot(data=plot_df, x='_class', y=feat, order=['inactive', 'active'],
-                      color='black', alpha=0.25, size=2.5, ax=ax)
-        p_val = results_df.loc[results_df['Feature'] == feat, 'p_value'].iloc[0]
-        sig = '***' if p_val < 0.001 else '**' if p_val < 0.01 else '*' if p_val < 0.05 else 'ns'
-        ax.set_title(f'{feat}\nMann-Whitney U, p = {p_val:.2e} ({sig})', fontsize=10)
-        ax.set_xlabel('')
-
-    for j in range(n, len(axes)):
-        axes[j].axis('off')
-
-    plt.tight_layout()
-    out_path = os.path.join(out_dir, 'mannwhitney_feature_comparison.png')
-    plt.savefig(out_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {out_path}")
-
-
-# ==========================================================================
-# 4. FINGERPRINT DESCRIPTOR GENERATION
-# ==========================================================================
-def generate_fingerprints(smiles_series, radius=2, n_bits=1024):
-    """
-    RDKit Morgan (ECFP-equivalent) fingerprints are used here as the binary
-    "fingerprint descriptors" described in the manuscript.
-
-    Note on PaDEL: the manuscript names the "Paddle" library, almost
-    certainly PaDEL-Descriptor -- a Java-based tool wrapped in Python via
-    `padelpy`. It computes a similar (and in the original study, PubChem-
-    style) fingerprint set, but requires a local Java Runtime Environment
-    and the PaDEL jar/XML descriptor files, which makes it far less portable
-    than a pure-Python dependency. RDKit's Morgan fingerprints are the
-    standard, dependency-light substitute and are used here so this script
-    runs with `pip install rdkit` alone. If you specifically need PaDEL
-    fingerprints (e.g. to match the original study bit-for-bit), install
-    `padelpy` and Java, then replace this function with a call to
-    `padelpy.from_smiles(smiles, fingerprints=True)`.
-    """
-    fps, valid_idx = [], []
-    for i, smi in enumerate(smiles_series):
-        mol = Chem.MolFromSmiles(str(smi))
+print("Cleaning dataset and calculating Lipinski rules using RDKit...")
+def process_smiles(smi):
+    """Canonicalize SMILES and calculate Lipinski properties."""
+    try:
+        mol = Chem.MolFromSmiles(smi)
         if mol is None:
-            continue
-        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=n_bits)
-        fps.append(np.array(fp, dtype=np.int8))
-        valid_idx.append(i)
-    X = np.array(fps, dtype=np.int8)
-    return X, valid_idx
+            return pd.Series([None, None, None, None, None, None])
+        
+        canon_smiles = Chem.MolToSmiles(mol)
+        mw = Descriptors.MolWt(mol)
+        logp = Descriptors.MolLogP(mol)
+        hbd = Lipinski.NumHDonors(mol)
+        hba = Lipinski.NumHAcceptors(mol)
+        rot_bonds = Lipinski.NumRotatableBonds(mol)
+        
+        return pd.Series([canon_smiles, mw, logp, hbd, hba, rot_bonds])
+    except:
+        return pd.Series([None, None, None, None, None, None])
 
+# Apply RDKit function
+df[['canonical_smiles_clean', 'MW_calc', 'LogP_calc', 'HBD_calc', 'HBA_calc', 'RotBonds_calc']] = df['canonical_smiles'].apply(process_smiles)
 
-# ==========================================================================
-# 5-6. ML DATASET PREP, FEATURE SELECTION, RF TRAINING
-# ==========================================================================
-def prepare_ml_dataset(df, args):
-    """
-    Restricts to clearly active/inactive compounds (intermediate-potency
-    compounds are excluded, as specified), computes fingerprints from
-    canonical_smiles, and aligns them with the pIC50 regression target.
-    """
-    df = df.copy()
-    df['_class'] = df['Activity Class'].apply(normalize_class_label)
-    ml_df = df[df['_class'].isin(['active', 'inactive'])].reset_index(drop=True)
-    print(f"\nCompounds retained for ML (active + inactive only): {len(ml_df)} of {len(df)}")
+# Drop invalid SMILES and Duplicates
+df = df.dropna(subset=['canonical_smiles_clean'])
+df = df.drop_duplicates(subset=['canonical_smiles_clean'])
 
-    X, valid_idx = generate_fingerprints(ml_df['canonical_smiles'], radius=args.radius, n_bits=args.n_bits)
-    ml_df = ml_df.iloc[valid_idx].reset_index(drop=True)
-    y = ml_df['pIC50_values'].values.astype(float)
+# Remove molecules with MW > 1000
+df = df[df['MW_calc'] <= 1000]
 
-    n_dropped = len(ml_df) - len(y)  # kept for symmetry/clarity; should be 0 here
-    print(f"Fingerprints generated for {X.shape[0]} compounds ({X.shape[1]}-bit Morgan/ECFP fingerprints).")
-    return X, y, ml_df
+# ==========================================
+# 3. IC50 NORMALIZATION & BIOACTIVITY CLASS
+# ==========================================
+print("Normalizing IC50 and classifying bioactivity...")
 
+# Cap extreme outliers at 10^8 nM
+df['standard_value_norm'] = df['standard_value'].clip(upper=1e8)
 
-def select_features(X_train, X_test, threshold=0.01):
-    """Variance thresholding, as specified (drops near-constant fingerprint bits)."""
-    imputer = SimpleImputer(strategy='mean')
-    X_train = imputer.fit_transform(X_train)
-    X_test = imputer.transform(X_test)
+# Convert to pIC50: pIC50 = -log10(IC50 * 10^-9) = 9 - log10(IC50)
+df['pIC50_values'] = 9 - np.log10(df['standard_value_norm'])
 
-    selector = VarianceThreshold(threshold=threshold)
-    X_train_sel = selector.fit_transform(X_train)
-    X_test_sel = selector.transform(X_test)
-    print(f"Variance thresholding (>= {threshold}): {X_train.shape[1]} -> {X_train_sel.shape[1]} features")
-    return X_train_sel, X_test_sel, selector, imputer
-
-
-def train_rf_model(X, y, args):
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=args.random_state)
-
-    X_train_sel, X_test_sel, selector, imputer = select_features(X_train, X_test, threshold=0.01)
-
-    base_model = RandomForestRegressor(random_state=args.random_state, n_jobs=-1)
-
-    if args.skip_tuning:
-        print("\n--skip_tuning set: fitting a default RandomForestRegressor (no search).")
-        best_model = base_model.fit(X_train_sel, y_train)
+# Bioactivity Classification
+def classify_activity(ic50):
+    if ic50 < 1000:
+        return 'Active'
+    elif ic50 >= 10000:
+        return 'Inactive'
     else:
-        param_dist = {
-            'n_estimators': randint(50, 500),
-            'max_depth': [None, 5, 10, 15, 20, 30],
-            'min_samples_split': randint(2, 10),
-            'min_samples_leaf': randint(1, 5),
-        }
-        search = RandomizedSearchCV(
-            base_model, param_distributions=param_dist, n_iter=args.n_iter_search,
-            cv=args.cv_folds, scoring='r2', random_state=args.random_state, n_jobs=-1, verbose=1)
-        print(f"\nRunning RandomizedSearchCV ({args.n_iter_search} iterations, {args.cv_folds}-fold CV)...")
-        search.fit(X_train_sel, y_train)
-        best_model = search.best_estimator_
-        print(f"Best hyperparameters: {search.best_params_}")
+        return 'Intermediate'
 
-    cv = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.random_state)
-    cv_r2 = cross_val_score(best_model, X_train_sel, y_train, cv=cv, scoring='r2', n_jobs=-1)
-    cv_rmse = -cross_val_score(best_model, X_train_sel, y_train, cv=cv,
-                                scoring='neg_root_mean_squared_error', n_jobs=-1)
+df['Activity Class'] = df['standard_value_norm'].apply(classify_activity)
 
-    y_pred = best_model.predict(X_test_sel)
-    test_r2 = r2_score(y_test, y_pred)
-    test_rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+# Filter out intermediate compounds
+df = df[df['Activity Class'] != 'Intermediate']
 
-    print(f"\nCross-validation ({args.cv_folds}-fold, training set): "
-          f"R2 = {cv_r2.mean():.4f} +/- {cv_r2.std():.4f} | "
-          f"RMSE = {cv_rmse.mean():.4f} +/- {cv_rmse.std():.4f}")
-    print(f"Held-out test set: R2 = {test_r2:.4f} | RMSE = {test_rmse:.4f}")
+# Save preprocessed dataset
+preprocessed_path = os.path.join(OUTPUT_DIR, 'preprocessed_dataset.csv')
+df.to_csv(preprocessed_path, index=False)
+print(f"Preprocessed data saved to: {preprocessed_path}")
 
-    return {
-        'model': best_model, 'selector': selector, 'imputer': imputer,
-        'y_test': y_test, 'y_pred': y_pred,
-        'cv_r2_mean': cv_r2.mean(), 'cv_r2_std': cv_r2.std(),
-        'cv_rmse_mean': cv_rmse.mean(), 'cv_rmse_std': cv_rmse.std(),
-        'test_r2': test_r2, 'test_rmse': test_rmse,
-    }
+# ==========================================
+# 4. HYPOTHESIS TESTING (Mann-Whitney U) & EDA
+# ==========================================
+print("Performing Mann-Whitney U tests & generating plots...")
+features_to_test = ['MW_calc', 'LogP_calc', 'HBD_calc', 'HBA_calc', 'standard_value_norm', 'pIC50_values']
 
+active_df = df[df['Activity Class'] == 'Active']
+inactive_df = df[df['Activity Class'] == 'Inactive']
 
-def plot_prediction_performance(result, out_dir):
-    y_test, y_pred = result['y_test'], result['y_pred']
-    fig, ax = plt.subplots(figsize=(6.5, 6))
-    ax.scatter(y_test, y_pred, alpha=0.6, edgecolor='black', linewidth=0.3, s=35, color='#0072B2')
-    lo, hi = min(y_test.min(), y_pred.min()), max(y_test.max(), y_pred.max())
-    ax.plot([lo, hi], [lo, hi], '--', color='#333333', linewidth=1.4, label='y = x')
-    ax.set_xlabel('Observed pIC50')
-    ax.set_ylabel('Predicted pIC50')
-    ax.set_title(f"RF regressor: predicted vs. observed pIC50\n"
-                 f"Test R\u00b2 = {result['test_r2']:.3f}, RMSE = {result['test_rmse']:.3f}")
-    ax.legend()
-    plt.tight_layout()
-    out_path = os.path.join(out_dir, 'rf_pIC50_predicted_vs_observed.png')
-    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+test_results = []
+
+sns.set_theme(style="whitegrid")
+for feature in features_to_test:
+    # Statistical Test
+    stat, p_val = mannwhitneyu(active_df[feature], inactive_df[feature], alternative='two-sided')
+    test_results.append({'Feature': feature, 'U-Statistic': stat, 'p-value': p_val})
+    
+    # Visualization
+    plt.figure(figsize=(8, 6))
+    sns.boxplot(x='Activity Class', y=feature, data=df, palette='Set2')
+    plt.title(f'Distribution of {feature} (p-value: {p_val:.2e})')
+    plt.savefig(os.path.join(OUTPUT_DIR, f'{feature}_boxplot.png'), dpi=300)
     plt.close()
-    print(f"Saved: {out_path}")
 
+# Save test results
+pd.DataFrame(test_results).to_csv(os.path.join(OUTPUT_DIR, 'mann_whitney_results.csv'), index=False)
 
-# ==========================================================================
-# 7. SAVE ARTIFACTS FOR THE STREAMLIT APP
-# ==========================================================================
-def save_artifacts(result, args, out_dir):
-    model_path = os.path.join(out_dir, 'rf_pIC50_model.pkl')
-    selector_path = os.path.join(out_dir, 'variance_selector.pkl')
-    imputer_path = os.path.join(out_dir, 'imputer.pkl')
-    config_path = os.path.join(out_dir, 'fingerprint_config.json')
+# ==========================================
+# 5. FEATURE ENGINEERING (FINGERPRINTS) & ML
+# ==========================================
+print("Generating Binary Fingerprint Descriptors...")
+def get_fingerprint(smi):
+    mol = Chem.MolFromSmiles(smi)
+    # Using Morgan Fingerprints as binary 0/1 descriptors
+    fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=1024)
+    return np.array(fp)
 
-    joblib.dump(result['model'], model_path)
-    joblib.dump(result['selector'], selector_path)
-    joblib.dump(result['imputer'], imputer_path)
-    with open(config_path, 'w') as f:
-        json.dump({'radius': args.radius, 'n_bits': args.n_bits}, f, indent=2)
+X = np.array([get_fingerprint(smi) for smi in df['canonical_smiles_clean']])
+y = df['pIC50_values'].values
 
-    print(f"\nSaved model to:      {model_path}")
-    print(f"Saved selector to:   {selector_path}")
-    print(f"Saved imputer to:    {imputer_path}")
-    print(f"Saved fp config to:  {config_path}")
-    print("These four files are exactly what pharmacogenix_app.py expects to find.")
+# Outlier Removal using IQR on Target Variable (pIC50)
+Q1 = np.percentile(y, 25)
+Q3 = np.percentile(y, 75)
+IQR = Q3 - Q1
+lower_bound = Q1 - 1.5 * IQR
+upper_bound = Q3 + 1.5 * IQR
 
+valid_idx = (y >= lower_bound) & (y <= upper_bound)
+X = X[valid_idx]
+y = y[valid_idx]
 
-# ==========================================================================
-# MAIN
-# ==========================================================================
-def main():
-    args = parse_args()
-    os.makedirs(args.outdir, exist_ok=True)
+# Missing Value Imputation (If any)
+imputer = SimpleImputer(strategy='most_frequent') # Best for binary data
+X = imputer.fit_transform(X)
 
-    df = load_data(args.data)
+# Variance Thresholding (threshold = 0.01)
+print("Applying Variance Thresholding...")
+selector = VarianceThreshold(threshold=0.01)
+X_selected = selector.fit_transform(X)
 
-    df_clean = remove_outliers(df, ['MW', 'LogP', 'standard_value_norm', 'pIC50_values'])
+# Save feature selector for Streamlit
+joblib.dump(selector, os.path.join(OUTPUT_DIR, 'variance_selector.pkl'))
 
-    print("\nRunning Mann-Whitney U tests (active vs. inactive)...")
-    mwu_results, df_with_class = run_mannwhitney_tests(df_clean, UTEST_FEATURES)
-    print(mwu_results.round(4).to_string(index=False))
-    mwu_results.to_csv(os.path.join(args.outdir, 'mannwhitney_results.csv'), index=False)
-    plot_mannwhitney_features(df_with_class, UTEST_FEATURES, mwu_results, args.outdir)
+# Train/Test Split (80/20)
+X_train, X_test, y_train, y_test = train_test_split(X_selected, y, test_size=0.2, random_state=42)
 
-    print("\nPreparing fingerprint-based ML dataset...")
-    X, y, ml_df = prepare_ml_dataset(df_clean, args)
+# ==========================================
+# 6. RANDOM FOREST MODEL BUILDING & TUNING
+# ==========================================
+print("Training and Optimizing Random Forest Regressor...")
+rf = RandomForestRegressor(random_state=42)
 
-    print("\nTraining Random Forest Regressor...")
-    result = train_rf_model(X, y, args)
-    plot_prediction_performance(result, args.outdir)
+param_grid = {
+    'n_estimators': [50, 100, 200, 500],
+    'max_depth': [None, 10, 20, 30],
+    'min_samples_split': [2, 5, 10]
+}
 
-    save_artifacts(result, args, args.outdir)
+grid_search = GridSearchCV(estimator=rf, param_grid=param_grid, cv=5, scoring='r2', n_jobs=-1, verbose=1)
+grid_search.fit(X_train, y_train)
 
-    summary = pd.DataFrame([{
-        'n_compounds_total': len(df), 'n_compounds_after_outlier_removal': len(df_clean),
-        'n_compounds_ml': len(ml_df), 'fingerprint_bits': args.n_bits, 'fingerprint_radius': args.radius,
-        'cv_r2_mean': result['cv_r2_mean'], 'cv_r2_std': result['cv_r2_std'],
-        'cv_rmse_mean': result['cv_rmse_mean'], 'cv_rmse_std': result['cv_rmse_std'],
-        'test_r2': result['test_r2'], 'test_rmse': result['test_rmse'],
-    }])
-    summary.to_csv(os.path.join(args.outdir, 'run_summary.csv'), index=False)
-    print(f"\nSaved run summary to: {os.path.join(args.outdir, 'run_summary.csv')}")
-    print("\nDone.")
+best_rf = grid_search.best_estimator_
+print(f"Best Parameters: {grid_search.best_params_}")
 
+# Evaluation
+y_pred = best_rf.predict(X_test)
+r2 = r2_score(y_test, y_pred)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
 
-if __name__ == '__main__':
-    main()
+print(f"Model Performance -> R2 Score: {r2:.4f} | RMSE: {rmse:.4f}")
+
+# Save the trained model
+model_path = os.path.join(OUTPUT_DIR, 'PharmacoGenix_RF_Model.pkl')
+joblib.dump(best_rf, model_path)
+print(f"Model saved to: {model_path}")
+
+# ==========================================
+# 7. GENERATE STREAMLIT APP
+# ==========================================
+print("Generating PharmacoGenix Streamlit App...")
+
+streamlit_code = f"""import streamlit as st
+import numpy as np
+import joblib
+from rdkit import Chem
+from rdkit.Chem import AllChem, Descriptors, Lipinski
+
+# Page Config
+st.set_page_config(page_title="PharmacoGenix Predictor", layout="centered")
+
+# Load Models
+@st.cache_resource
+def load_models():
+    model = joblib.load(r"{model_path}")
+    selector = joblib.load(r"{os.path.join(OUTPUT_DIR, 'variance_selector.pkl')}")
+    return model, selector
+
+rf_model, variance_selector = load_models()
+
+def get_fingerprint_and_properties(smi):
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return None, None
+    
+    # Fingerprint
+    fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=1024)
+    fp_array = np.array(fp).reshape(1, -1)
+    
+    # Properties
+    props = {{
+        'MW': Descriptors.MolWt(mol),
+        'LogP': Descriptors.MolLogP(mol),
+        'HBD': Lipinski.NumHDonors(mol),
+        'HBA': Lipinski.NumHAcceptors(mol),
+        'Rotatable Bonds': Lipinski.NumRotatableBonds(mol)
+    }}
+    return fp_array, props
+
+st.title("🧬 PharmacoGenix")
+st.subheader("Predicting MAB Therapeutics pIC50 via Machine Learning")
+
+st.markdown("Enter a **Canonical SMILES** string below to evaluate its molecular properties and predict its bioactivity (pIC50) using the optimized Random Forest Regressor.")
+
+smiles_input = st.text_input("Enter SMILES string:", "CC1=C(C=C(C=C1)NC(=O)C2=CC=C(C=C2)CN3CCN(CC3)C)NC4=NC=CC(=N4)C5=CN=CC=C5")
+
+if st.button("Predict pIC50"):
+    if smiles_input:
+        fp_array, properties = get_fingerprint_and_properties(smiles_input)
+        
+        if fp_array is not None:
+            # Display properties
+            st.write("### 🧪 Lipinski Properties Evaluated")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("MW", f"{{properties['MW']:.2f}}")
+            col2.metric("LogP", f"{{properties['LogP']:.2f}}")
+            col3.metric("HBD", properties['HBD'])
+            col4.metric("HBA", properties['HBA'])
+            col5.metric("Rot Bonds", properties['Rotatable Bonds'])
+            
+            # Predict
+            try:
+                # Apply variance thresholding
+                fp_selected = variance_selector.transform(fp_array)
+                
+                # Predict
+                prediction = rf_model.predict(fp_selected)[0]
+                
+                st.write("### 🎯 Prediction Results")
+                st.success(f"Predicted pIC50: **{{prediction:.4f}}**")
+                
+                # Reverse math for IC50 (nM)
+                predicted_ic50 = 10**(9 - prediction)
+                if predicted_ic50 < 1000:
+                    st.info(f"Estimated IC50: {{predicted_ic50:.2f}} nM (Likely **Active**)")
+                elif predicted_ic50 >= 10000:
+                    st.error(f"Estimated IC50: {{predicted_ic50:.2f}} nM (Likely **Inactive**)")
+                else:
+                    st.warning(f"Estimated IC50: {{predicted_ic50:.2f}} nM (**Intermediate**)")
+                    
+            except Exception as e:
+                st.error(f"Error during prediction: {{e}}")
+        else:
+            st.error("Invalid SMILES string. Please check your input and try again.")
+    else:
+        st.warning("Please enter a SMILES string first.")
+"""
+
+app_path = os.path.join(OUTPUT_DIR, 'PharmacoGenix_app.py')
+with open(app_path, "w", encoding="utf-8") as f:
+    f.write(streamlit_code)
+
+print(f"\n✅ Pipeline Complete! Streamlit App generated at: {app_path}")
+print("To run the application, open your terminal and type:")
+print(f'streamlit run "{app_path}"')
